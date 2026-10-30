@@ -43,6 +43,21 @@ TOKEN_EXPIRY_BUFFER_SECONDS = 300  # Refresh token 5 minutes before expiry
 ACCEPTED_SAP_EXIT_CODES = [0, 3, 4]  # Exit codes considered successful for sapcontrol
 CRM_COMMAND_TIMEOUT_SECONDS = 10
 
+def _diagnostic_excerpt(value):
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value) if value is not None else ""
+    if re.search(r'\b(authorization|bearer|access_token|refresh_token|client_secret|password)\b', text, re.IGNORECASE):
+        return "<sensitive output omitted>"
+    return text[:1024] + ("... [truncated]" if len(text) > 1024 else "")
+
+
+def _diagnostic_endpoint(url):
+    parsed = urlparse(url)
+    return parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1], query="", fragment="").geturl()
+
+
 #####################################################
 """
 Helper functions for Pacemaker cluster
@@ -61,7 +76,6 @@ class ClusterHelper:
     def _exec(command, *args):
         """Helper function to execute a UNIX command."""
         args = list(args)
-        ocf.logger.debug("_exec: begin; command = %s, args = %s" % (command, str(args)))
 
         def flatten(*n):
             return (
@@ -71,7 +85,10 @@ class ClusterHelper:
             )
 
         cmd = list(flatten([command] + args))
-        ocf.logger.debug("_exec: cmd = %s" % " ".join(cmd))
+        started = time.monotonic()
+        stdout, stderr = "", ""
+        rc = None
+        outcome = "failed"
         try:
             completed = subprocess.run(
                 cmd,
@@ -80,28 +97,42 @@ class ClusterHelper:
                 universal_newlines=True,
                 timeout=CRM_COMMAND_TIMEOUT_SECONDS,
             )
-            ret = completed.stdout or ""
-            ocf.logger.debug("_exec: return = %s" % ret)
-            return ret.rstrip()
-        except subprocess.TimeoutExpired:
-            ocf.logger.error(f"Command timed out after {CRM_COMMAND_TIMEOUT_SECONDS}s: {' '.join(cmd)}")
-            return None
-        except Exception as err:
-            ocf.logger.error(f"Failed to execute command: {err}")
-            return None
+            stdout, stderr = completed.stdout or "", completed.stderr or ""
+            rc = completed.returncode
+            outcome = "success" if rc == 0 else "failed"
+            ret = stdout.rstrip()
+        except subprocess.TimeoutExpired as error:
+            stdout, stderr = error.stdout or "", error.stderr or ""
+            outcome = "timeout"
+            ret = None
+        except Exception as error:
+            stderr = str(error)
+            outcome = "launch_error" if isinstance(error, OSError) else "execution_error"
+            ret = None
+
+        message = (
+            f"crm_command: command={_diagnostic_excerpt(' '.join(shlex.quote(arg) for arg in cmd))!r} "
+            f"outcome={outcome} rc={rc if rc is not None else 'unknown'} "
+            f"elapsed_ms={int((time.monotonic() - started) * 1000)} "
+            f"timeout_s={CRM_COMMAND_TIMEOUT_SECONDS} stdout_length={len(stdout)} stderr_length={len(stderr)} "
+            f"stdout={_diagnostic_excerpt(stdout)!r} stderr={_diagnostic_excerpt(stderr)!r}")
+        if outcome != "success":
+            ocf.logger.error(message)
+        else:
+            ocf.logger.debug(message)
+        return ret
 
     @staticmethod
     def setAttr(key, value, node=None):
         """Set the value of a specific global/local attribute in the Pacemaker cluster."""
-        ocf.logger.debug("setAttr: begin; key = %s, value = %s, node = %s" % (key, value, node))
-
         def _is_empty(v) -> bool:
             if v is None:
                 return True
             s = str(v).strip()
             return s == "" or s.lower() == "none"
 
-        if not _is_empty(value):
+        delete = _is_empty(value)
+        if not delete:
             ret = ClusterHelper._exec(
                 "crm_attribute",
                 "--name",
@@ -118,7 +149,10 @@ class ClusterHelper:
                 "--delete",
                 ClusterHelper._getLocation(node),
             )
-        ocf.logger.debug("setAttr: finished")
+        ocf.logger.debug(
+            "setAttr: operation=%s key=%s node=%s scope=%s value=%r outcome=%s",
+            "delete" if delete else "update", key, node, "nodes" if node else "crm_config",
+            _diagnostic_excerpt(value), "success" if ret is not None else "failed")
         return ret is not None
 
     @staticmethod
@@ -135,7 +169,10 @@ class ClusterHelper:
             "",
             ClusterHelper._getLocation(node),
         )
-        ocf.logger.debug("getAttr: finished")
+        ocf.logger.debug(
+            "getAttr: key=%s node=%s scope=%s outcome=%s value=%r",
+            key, node, "nodes" if node else "crm_config", "present" if val else "missing",
+            _diagnostic_excerpt(val))
         if not val:
             return None
         return val if not val.isdigit() else int(val)
@@ -155,7 +192,9 @@ class ClusterHelper:
             "--default",
             "",
         )
-        ocf.logger.debug("getStatusAttr: finished")
+        ocf.logger.debug(
+            "getStatusAttr: key=%s node=%s scope=status outcome=%s value=%r",
+            key, node, "present" if val else "missing", _diagnostic_excerpt(val))
         if not val:
             return None
         return val if not val.isdigit() else int(val)
@@ -187,7 +226,7 @@ class AzureHelper:
         if parsed.scheme != 'https' or not parsed.netloc or parsed.path or parsed.params or parsed.query or parsed.fragment:
             raise ValueError("azure_management_endpoint must be an HTTPS URL without path, query, or fragment")
         endpoint = f"https://{parsed.netloc.lower()}"
-        ocf.logger.debug(f"normalize_management_url: Finished (endpoint={endpoint})")
+        ocf.logger.debug(f"normalize_management_url: Finished (endpoint={_diagnostic_endpoint(endpoint)})")
         return endpoint
 
     @staticmethod
@@ -214,7 +253,7 @@ class AzureHelper:
             if azure_environment:
                 ocf.logger.warning("azure_management_endpoint is set; ignoring azure_environment")
             management_url = AzureHelper.normalize_management_url(azure_management_endpoint)
-            ocf.logger.debug(f"Using Azure management endpoint from azure_management_endpoint: {management_url}")
+            ocf.logger.debug(f"Using Azure management endpoint from azure_management_endpoint: {_diagnostic_endpoint(management_url)}")
             ocf.logger.debug("resolve_management_url: Finished (source=azure_management_endpoint)")
             return management_url, "custom"
 
@@ -238,42 +277,63 @@ class AzureHelper:
             )
         if headers is None:
             headers = AzureHelper.DEFAULT_HEADERS
-        ocf.logger.debug("invoke_azure_api: Started")
-        ocf.logger.debug(f"invoke_azure_api: url = {url}")
-        ocf.logger.debug(f"invoke_azure_api: method = {method}")
-        ocf.logger.debug(f"invoke_azure_api: body = {body}")
-        ocf.logger.debug(f"invoke_azure_api: params = {params}")
-        
+        started = time.monotonic()
+        endpoint = _diagnostic_endpoint(url)
+        api_version = params.get("api-version") if isinstance(params, dict) else None
+        ocf.logger.debug(
+            "invoke_azure_api: method=%s endpoint=%s api_version=%s body_present=%s",
+            method, endpoint, api_version, body is not None)
         success = False
         last_error = None
-        for retry in range(node.retry_count + 1):
-            try:
-                response = requests.request(method, url, headers=headers, json=body, params=params, timeout=AZURE_API_REQUEST_TIMEOUT)
-                ocf.logger.debug(f"invoke_azure_api: response status = {response.status_code}")
-                if response.status_code in [200, 201, 202]:
-                    success = True
-                    break
-                elif response.status_code in [429, 500, 502, 503, 504]:  # Retry on these status codes
-                    last_error = f"Status code: {response.status_code}. Content: {response.text[:200]}"
-                    wait_time = node.retry_wait * (2 ** retry)  # Exponential backoff
-                    ocf.logger.debug(f"invoke_azure_api: retry {retry + 1}/{node.retry_count + 1}, waiting {wait_time}s")
+        attempts = 0
+        outcome = "failed"
+        try:
+            for retry in range(node.retry_count + 1):
+                request_timeout = AZURE_API_REQUEST_TIMEOUT
+                attempts += 1
+                request_started = time.monotonic()
+                try:
+                    response = requests.request(method, url, headers=headers, json=body, params=params, timeout=request_timeout)
+                    ocf.logger.debug(
+                        "azure_api_attempt: method=%s endpoint=%s api_version=%s attempt=%s/%s "
+                        "timeout_s=%s status=%s outcome=response_received elapsed_ms=%s response_bytes=%s",
+                        method, endpoint, api_version, attempts, node.retry_count + 1, request_timeout,
+                        response.status_code, int((time.monotonic() - request_started) * 1000),
+                        len(getattr(response, "content", b"") or b""))
+                    if response.status_code in [200, 201, 202]:
+                        success = True
+                        outcome = "success"
+                        break
+                    elif response.status_code in [429, 500, 502, 503, 504]:  # Retry on these status codes
+                        last_error = f"Status code: {response.status_code}"
+                        wait_time = node.retry_wait * (2 ** retry)  # Exponential backoff
+                        ocf.logger.debug(f"invoke_azure_api: retry {retry + 1}/{node.retry_count + 1}, waiting {wait_time}s")
+                        time.sleep(wait_time)
+                    else:
+                        last_error = f"Status code: {response.status_code}"
+                        break  # Don't retry on client errors
+                except requests.exceptions.RequestException as error:
+                    last_error = f"Request exception: {type(error).__name__}"
+                    ocf.logger.debug(
+                        "azure_api_attempt: method=%s endpoint=%s api_version=%s attempt=%s/%s "
+                        "timeout_s=%s status=none outcome=transport_error error_type=%s elapsed_ms=%s",
+                        method, endpoint, api_version, attempts, node.retry_count + 1, request_timeout,
+                        type(error).__name__, int((time.monotonic() - request_started) * 1000))
+                    wait_time = node.retry_wait * (2 ** retry)
+                    ocf.logger.debug(f"invoke_azure_api: retry {retry + 1}/{node.retry_count + 1} due to exception, waiting {wait_time}s")
                     time.sleep(wait_time)
-                else:
-                    last_error = f"Status code: {response.status_code}. Content: {response.text[:200]}"
-                    break  # Don't retry on client errors
-            except requests.exceptions.RequestException as e:
-                last_error = f"Request exception: {str(e)}"
-                wait_time = node.retry_wait * (2 ** retry)
-                ocf.logger.debug(f"invoke_azure_api: retry {retry + 1}/{node.retry_count + 1} due to exception, waiting {wait_time}s")
-                time.sleep(wait_time)
 
-        if not success:
-            error_msg = f"Failed to execute API call after {node.retry_count + 1} attempts. Last error: {last_error}"
-            ocf.logger.error(error_msg)
-            raise Exception(error_msg)
-        
-        ocf.logger.debug("invoke_azure_api: Finished")
-        return response
+            if not success:
+                error_msg = (
+                    f"Failed to execute API call: method={method} endpoint={endpoint} "
+                    f"api_version={api_version} after {attempts} attempts. Last error: {last_error}")
+                ocf.logger.error(error_msg)
+                raise Exception(error_msg)
+            return response
+        finally:
+            ocf.logger.debug(
+                "azure_api_summary: method=%s endpoint=%s api_version=%s attempts=%s outcome=%s elapsed_ms=%s",
+                method, endpoint, api_version, attempts, outcome, int((time.monotonic() - started) * 1000))
 
     @staticmethod
     def get_access_token(node):
@@ -321,7 +381,11 @@ class AzureHelper:
         resource_group = compute_metadata['resourceGroupName'].strip()
         zone = (compute_metadata.get('zone') or '').strip()
         az_environment = (compute_metadata.get('azEnvironment') or '').strip()
-        ocf.logger.debug(f"az_vm_name: {az_vm_name}, subscription_id: {subscription_id}, location: {location}, resource_group: {resource_group}, zone: {zone or 'None'}, az_environment: {az_environment or 'None'}")
+        ocf.logger.debug(
+            "imds_compute: vm_name=%s subscription_id=%s location=%s resource_group=%s "
+            "zone=%s az_environment=%s vm_size=%s os_type=%s",
+            az_vm_name, subscription_id, location, resource_group, zone or "None", az_environment or "None",
+            compute_metadata.get("vmSize"), compute_metadata.get("osType"))
         if not az_vm_name or not subscription_id or not location or not resource_group:
             raise Exception("Failed to retrieve Azure metadata (az_vm_name, subscription_id, location, resource_group) from VM instance metadata API")
         ocf.logger.debug("get_instance_metadata: Finished")
@@ -456,10 +520,13 @@ class AzureHelper:
                     "timeoutInSeconds": random.randint(command_execution_timeout, (command_execution_timeout + 300))
                 }
             }
-            ocf.logger.debug(f"run_command_on_linux_vms: url = {url}")
-            ocf.logger.debug(f"run_command_on_linux_vms: body = {body}")
+            ocf.logger.debug(
+                "run_command_on_linux_vms: vm=%s script_chars=%s timeout_s=%s",
+                vm_name, len(command), body["properties"]["timeoutInSeconds"])
             response = AzureHelper.invoke_api(node, url, 'put', headers=headers, body=body, params=params)
-            ocf.logger.debug(f"run_command_on_linux_vms: response = {response}")
+            ocf.logger.debug(
+                "run_command_on_linux_vms: delivered vm=%s status=%s",
+                vm_name, getattr(response, "status_code", None))
 
         output = [{"vm_name": vm_name, "execution_state": "", "stdout": "", "stderr": ""} for vm_name in vm_names]
 
@@ -492,8 +559,10 @@ class AzureHelper:
                     stderr = instance_view['error']
                     item['stdout'] = stdout
                     item['stderr'] = stderr
-                    ocf.logger.debug(f"run_command_on_linux_vms: stdout = {stdout}")
-                    ocf.logger.debug(f"run_command_on_linux_vms: stderr = {stderr}")
+                    ocf.logger.debug(
+                        "run_command_on_linux_vms: vm=%s stdout_length=%s stderr_length=%s stderr=%r",
+                        vm_name, len(stdout or ""), len(stderr or ""), _diagnostic_excerpt(stderr))
+                    ocf.logger.debug("run_command_on_linux_vms: stdout=%r", _diagnostic_excerpt(stdout))
             if time.time() - start_time > command_execution_timeout:
                 error_message = f"Command execution has not finished on vms {pending_vms} within the timeout period of {command_execution_timeout} seconds. Ensure that Azure Linux VM Agent is running on the VM"
                 ocf.logger.error(error_message)
@@ -505,7 +574,9 @@ class AzureHelper:
         ocf.logger.debug(f"Note: Some commands, such as sapcontrol -function GetProcessList, return an execution_state of 'failed' even when the command is successful. In these cases, the exit codes will be {ACCEPTED_SAP_EXIT_CODES}. These exit codes should be ignored and considered as successful.")
         failed_vms = [item for item in output if item.get('exit_code') not in ACCEPTED_SAP_EXIT_CODES]
         if failed_vms:
-            error_details = [f"VM: {vm['vm_name']}, Exit Code: {vm['exit_code']}, Error: {vm.get('stderr', 'N/A')}" for vm in failed_vms]
+            error_details = [
+                f"VM: {vm['vm_name']}, Exit Code: {vm['exit_code']}, "
+                f"Error: {_diagnostic_excerpt(vm.get('stderr', 'N/A'))!r}" for vm in failed_vms]
             raise Exception(f"Command execution failed for the following VMs: {'; '.join(error_details)}")
         return output
 
@@ -579,11 +650,13 @@ class SAPHelper:
                 su - {sidadm} -c "sapcontrol -nr ${{instance}} -function {function_name} {' '.join(function_args)}"
             done
             """
-        ocf.logger.debug(f"command: {command}")
+        ocf.logger.debug(
+            "run_sapcontrol_function: sid=%s vms=%s function=%s instance=%s script_chars=%s",
+            node.sid, vm_names, function_name, instance, len(command))
 
         try:
             output = AzureHelper.run_command_on_linux_vms(node, vm_names, command)
-            ocf.logger.debug(f"run_sapcontrol_function: output: {output}")
+            ocf.logger.debug("run_sapcontrol_function: result_count=%s", len(output) if output else 0)
             if not output:
                 raise ValueError(f"No output received from sapcontrol function {function}")
         except Exception as e:
@@ -644,11 +717,13 @@ class SAPHelper:
                 fi
             done
             """
-        ocf.logger.debug(f"command: {command}")
+        ocf.logger.debug(
+            "check_and_start_sap_instance: sid=%s vms=%s instance=%s script_chars=%s",
+            node.sid, vm_names, instance, len(command))
 
         try:
             output = AzureHelper.run_command_on_linux_vms(node, vm_names, command)
-            ocf.logger.debug(f"check_and_start_sap_instance: output: {output}")
+            ocf.logger.debug("check_and_start_sap_instance: result_count=%s", len(output) if output else 0)
             if not output:
                 raise ValueError(f"No output received from check_and_start_sap_instance")
         except Exception as e:
@@ -663,7 +738,7 @@ class SAPHelper:
     # format SAPControl output in csv format to a list of dictionary objects
     def format_sapcontrol_output(stdout):
         ocf.logger.debug("format_sapcontrol_output: Started")
-        ocf.logger.debug(f"stdout: {stdout}")
+        ocf.logger.debug("format_sapcontrol_output: stdout=%r", _diagnostic_excerpt(stdout))
         stdout = stdout.split('\n')
         # remove lines that don't have ',' - these are usually sapcontrol execution status, time etc.
         stdout = [line for line in stdout if ',' in line]
@@ -672,7 +747,7 @@ class SAPHelper:
         stdout = [line for line in stdout if line != stdout[0]]
         values = [line.split(', ') for line in stdout]
         data = [dict(zip(keys, value)) for value in values]
-        ocf.logger.debug(f"data: {data}")
+        ocf.logger.debug("format_sapcontrol_output: data=%s", _diagnostic_excerpt(data))
         ocf.logger.debug("format_sapcontrol_output: Finished")
         return data
 
@@ -697,17 +772,17 @@ class SAPHelper:
         if not output:
             raise ValueError("Failed to retrieve SAP process list - no output received")
         
-        ocf.logger.debug(f"output: {output}")
+        ocf.logger.debug("get_sap_procs: result_count=%s", len(output))
         all_sap_procs = []
         for item in output:
             if not item or 'stdout' not in item:
-                ocf.logger.warning(f"Skipping invalid output item: {item}")
+                ocf.logger.warning("Skipping invalid output item: %s", _diagnostic_excerpt(item))
                 continue
             sap_procs = SAPHelper.format_sapcontrol_output(item['stdout'])
             for process in sap_procs:
                 process['vm_name'] = item.get('vm_name', 'unknown')
             all_sap_procs.extend(sap_procs)
-        ocf.logger.debug(f"get_sap_procs: all_sap_procs: {all_sap_procs}")
+        ocf.logger.debug("get_sap_procs: all_sap_procs=%s", _diagnostic_excerpt(all_sap_procs))
         ocf.logger.debug("get_sap_procs: Finished")
         return all_sap_procs
     
@@ -744,7 +819,7 @@ class SAPHelper:
         
         for process in sap_procs:
             if 'name' not in process:
-                ocf.logger.warning(f"Process missing 'name' field: {process}")
+                ocf.logger.warning("Process missing 'name' field: %s", _diagnostic_excerpt(process))
                 continue
             if re.match(r"msg_server|enq_server|enq_replicator|hdbdaemon", process['name'], re.IGNORECASE):
                 ocf.logger.warning(f"One or more servers in {vm_names} have MESSAGESERVER, ENQUE, or HDB processes running. Please provide correct app_vm_names")
@@ -1095,8 +1170,8 @@ class AzureSapZone:
         ocf.logger.debug(f"detected_azure_environment: {getattr(self.node, 'detected_azure_environment', None)}")
         ocf.logger.debug(f"azure_environment: {getattr(self.node, 'azure_environment', None)}")
         ocf.logger.debug(f"resolved_azure_environment: {getattr(self.node, 'resolved_azure_environment', None)}")
-        ocf.logger.debug(f"azure_management_endpoint: {getattr(self.node, 'azure_management_endpoint', None)}")
-        ocf.logger.debug(f"management_url: {getattr(self.node, 'management_url', None)}")
+        ocf.logger.debug(f"azure_management_endpoint: {_diagnostic_endpoint(getattr(self.node, 'azure_management_endpoint', '') or '')}")
+        ocf.logger.debug(f"management_url: {_diagnostic_endpoint(getattr(self.node, 'management_url', '') or '')}")
         ocf.logger.debug(f"hana_vm_zones: {getattr(self.node, 'hana_vm_zones', None)}")
         ocf.logger.debug(f"location: {self.node.location}")
         ocf.logger.debug(f"client_id: {self.node.client_id}")
@@ -1426,26 +1501,56 @@ def setLoglevel(verbose):
     ocf.log.setLevel(loglevel)
     _configure_trace_logging(loglevel)
 
+
+def _log_action_summary(action, started, ra, rc):
+    node = getattr(ra, "node", None)
+    if rc is None:
+        outcome = "exception"
+    elif rc == ocf.OCF_SUCCESS:
+        outcome = "success"
+    elif action == "monitor" and rc == ocf.OCF_NOT_RUNNING:
+        outcome = "not_running"
+    else:
+        outcome = "failed"
+    ocf.logger.debug(
+        "%s_summary: resource=%s node=%s phase=%r outcome=%s rc=%s elapsed_ms=%s",
+        action, ocf.OCF_RESOURCE_INSTANCE, getattr(node, "hostname", None),
+        _diagnostic_excerpt(getattr(node, "current_phase", None)), outcome,
+        rc if rc is not None else "not_returned", int((time.monotonic() - started) * 1000))
+
+
 def start_action():
-    ocf.logger.debug("start_action: Started")
-    ra = AzureSapZone()
-    rc = ra.start()
-    ocf.logger.debug(f"start_action: Finished (rc={rc})")
-    return rc
+    started = time.monotonic()
+    ra, rc = None, None
+    try:
+        ocf.logger.debug("start_action: Started")
+        ra = AzureSapZone()
+        rc = ra.start()
+        return rc
+    finally:
+        _log_action_summary("start", started, ra, rc)
 
 def stop_action():
-    ocf.logger.debug("stop_action: Started")
-    ra = AzureSapZone()
-    rc = ra.stop()
-    ocf.logger.debug(f"stop_action: Finished (rc={rc})")
-    return rc
+    started = time.monotonic()
+    ra, rc = None, None
+    try:
+        ocf.logger.debug("stop_action: Started")
+        ra = AzureSapZone()
+        rc = ra.stop()
+        return rc
+    finally:
+        _log_action_summary("stop", started, ra, rc)
 
 def monitor_action():
-    ocf.logger.debug("monitor_action: Started")
-    ra = AzureSapZone()
-    rc = ra.monitor()
-    ocf.logger.debug(f"monitor_action: Finished (rc={rc})")
-    return rc
+    started = time.monotonic()
+    ra, rc = None, None
+    try:
+        ocf.logger.debug("monitor_action: Started")
+        ra = AzureSapZone()
+        rc = ra.monitor()
+        return rc
+    finally:
+        _log_action_summary("monitor", started, ra, rc)
 
 def validate_action(sid, soft_shutdown_timeout, app_vm_names, client_id, app_vm_name_pattern, hana_resource, app_vm_zones=None, hana_vm_zones=None, azure_environment=None, azure_management_endpoint=None):
     ocf.logger.debug("validate_action: Started")
