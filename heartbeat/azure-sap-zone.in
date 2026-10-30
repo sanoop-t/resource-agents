@@ -1367,12 +1367,64 @@ class AzureSapZone:
         ocf.logger.info("All phases have been executed successfully")
         ocf.logger.debug("phase_stop_vms_in_diff_zone: Finished")
 
+class _TraceHandler(ocf.logging.FileHandler):
+    def _open(self):
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND, 0o600)
+        try:
+            return os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            os.close(fd)
+            raise
+
+    def handleError(self, record):
+        if self.level <= ocf.logging.CRITICAL:
+            self.setLevel(ocf.logging.CRITICAL + 1)
+            ocf.logger.warning(
+                "trace_ra: trace write failed (%s); tracing disabled for this action",
+                type(sys.exc_info()[1]).__name__)
+
+
+def _configure_trace_logging(loglevel):
+    trace_ra = os.environ.get("OCF_TRACE_RA") or ocf.get_parameter("trace_ra", "")
+    if not (ocf.is_true(trace_ra) or trace_ra == "True"):
+        return
+    if not ocf.OCF_ACTION or ocf.OCF_ACTION in ("meta-data", "usage", "methods", "-h", "--help"):
+        return
+
+    try:
+        trace_dir = ocf.get_parameter("trace_dir") or os.path.join(
+            os.environ.get("HA_VARLIB") or "@HA_VARLIBHBDIR@", "trace_ra")
+        if not os.path.isabs(trace_dir):
+            raise ValueError("trace_dir must be an absolute path")
+        trace_dir = os.path.join(trace_dir, "azure-sap-zone")
+        os.makedirs(trace_dir, mode=0o750, exist_ok=True)
+        instance = (ocf.OCF_RESOURCE_INSTANCE or "unknown").replace("/", "_")
+        action = ocf.OCF_ACTION.replace("/", "_")
+        trace_path = os.path.join(
+            trace_dir, f"{instance}.{action}.{time.strftime('%Y-%m-%d.%H:%M:%S')}.{os.getpid()}")
+        handler = _TraceHandler(trace_path, mode="a", encoding="utf-8")
+        handler.setLevel(ocf.logging.DEBUG)
+        handler.setFormatter(ocf.logging.Formatter(
+            "%(asctime)s.%(msecs)03d [%(process)d] %(levelname)s: %(message)s",
+            "%Y-%m-%d %H:%M:%S"))
+    except (OSError, ValueError) as error:
+        ocf.logger.warning("trace_ra requested but not enabled: %s", error)
+        return
+
+    def route_trace(record):
+        if record.levelno >= handler.level:
+            handler.handle(record)
+        return record.levelno >= loglevel
+
+    # Keep the trace handler separate so existing handlers and stderr fallback are unchanged.
+    ocf.log.addFilter(route_trace)
+    ocf.log.setLevel(ocf.logging.DEBUG)
+
+
 def setLoglevel(verbose):
-	# set up writing into syslog
-	loglevel = default_loglevel
-	if verbose:
-		loglevel = ocf.logging.DEBUG
-	ocf.log.setLevel(loglevel)
+    loglevel = ocf.logging.DEBUG if verbose else default_loglevel
+    ocf.log.setLevel(loglevel)
+    _configure_trace_logging(loglevel)
 
 def start_action():
     ocf.logger.debug("start_action: Started")
@@ -1508,8 +1560,31 @@ in the same Availability zone as the HANA database server to avoid network laten
                 meta clone-node-max=1 target-role=Started interleave=true
     
     Troubleshooting:
-        Set the verbose parameter to true.
-        Check pacemaker.log file: 
+        The verbose parameter enables detailed output in the existing logging destinations.
+        For temporary monitor tracing, use the primitive resource ID, not the clone ID:
+            crm resource trace RESOURCE_ID monitor
+        Disable monitor tracing after troubleshooting:
+            crm resource untrace RESOURCE_ID monitor
+
+        trace_ra is off by default and independent of verbose. It captures existing DEBUG
+        messages in separate files without changing normal logging. This is not a
+        line-by-line execution trace. Metadata and help actions do not create trace files.
+        crmsh may still display its generic warning about non-shell resource agents.
+
+        Trace files are written under trace_dir/azure-sap-zone/. If trace_dir is unset,
+        the default is $HA_VARLIB/trace_ra, using the package build path when HA_VARLIB
+        is unset. Files include the resource instance, action, timestamp and PID, and
+        are readable only by the owner. Use local disk: a blocked trace filesystem can
+        delay the operation. Files are not automatically removed; disable tracing and
+        clean them up after diagnosis.
+
+        Confirm monitor-only tracing behavior on the target SUSE version before production
+        use. Changing resource-wide parameters, including verbose or trace_ra, can restart
+        the agent and rerun alignment. Do not invoke monitor manually alongside Pacemaker.
+        A nonempty OCF_TRACE_RA overrides trace_ra for direct invocations. OCF_TRACE_FILE
+        and trace_file are not supported; use trace_dir to select the output directory.
+
+        Check pacemaker.log file:
             grep -i 'azure-sap-zone' /var/log/pacemaker/pacemaker.log
             grep -iE 'azure-sap-zone.*(INFO|WARNING|ERROR):' /var/log/pacemaker/pacemaker.log | grep -v -iE "All phases|monitor: Started" 
 """)
@@ -1546,7 +1621,7 @@ def main():
     agent.add_parameter(
         "verbose",
         shortdesc="Enable verbose agent logging",
-        longdesc="Set to true to enable verbose logging",
+        longdesc="Set to true to enable verbose logging in the existing logging destinations. Independent of trace_ra.",
         content_type="boolean",
         default="false")
     agent.add_parameter(
