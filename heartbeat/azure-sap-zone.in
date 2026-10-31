@@ -13,6 +13,8 @@ import subprocess
 import re
 import shlex
 import random
+import base64
+import uuid
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -44,6 +46,7 @@ TOKEN_EXPIRY_BUFFER_SECONDS = 300  # Refresh token 5 minutes before expiry
 ACCEPTED_SAP_EXIT_CODES = [0, 3, 4]  # Exit codes considered successful for sapcontrol
 CRM_COMMAND_TIMEOUT_SECONDS = 10
 
+
 def _diagnostic_excerpt(value):
     if isinstance(value, bytes):
         text = value.decode("utf-8", errors="replace")
@@ -58,6 +61,12 @@ def _diagnostic_endpoint(url):
     parsed = urlparse(url)
     return parsed._replace(netloc=parsed.netloc.rsplit("@", 1)[-1], query="", fragment="").geturl()
 
+
+def remaining_time(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("SAP alignment operation deadline reached")
+    return remaining
 
 #####################################################
 """
@@ -267,7 +276,7 @@ class AzureHelper:
         return management_url, resolved_environment
 
     @staticmethod
-    def invoke_api(node, url, method, headers=None, body=None, params=None):
+    def invoke_api(node, url, method, headers=None, body=None, params=None, deadline=None):
         if requests is None:
             raise Exception(
                 "Python module 'requests' is required for Azure API calls. "
@@ -285,31 +294,17 @@ class AzureHelper:
         last_error = None
         attempts = 0
         outcome = "failed"
+        if deadline is None:
+            deadline = getattr(node, 'operation_deadline', None)
         try:
             for retry in range(node.retry_count + 1):
                 request_timeout = AZURE_API_REQUEST_TIMEOUT
+                if deadline is not None:
+                    request_timeout = min(request_timeout, remaining_time(deadline) / 2)
                 attempts += 1
                 request_started = time.monotonic()
                 try:
                     response = requests.request(method, url, headers=headers, json=body, params=params, timeout=request_timeout)
-                    ocf.logger.debug(
-                        "azure_api_attempt: method=%s endpoint=%s api_version=%s attempt=%s/%s "
-                        "timeout_s=%s status=%s outcome=response_received elapsed_ms=%s response_bytes=%s",
-                        method, endpoint, api_version, attempts, node.retry_count + 1, request_timeout,
-                        response.status_code, int((time.monotonic() - request_started) * 1000),
-                        len(getattr(response, "content", b"") or b""))
-                    if response.status_code in [200, 201, 202]:
-                        success = True
-                        outcome = "success"
-                        break
-                    elif response.status_code in [429, 500, 502, 503, 504]:  # Retry on these status codes
-                        last_error = f"Status code: {response.status_code}"
-                        wait_time = node.retry_wait * (2 ** retry)  # Exponential backoff
-                        ocf.logger.debug(f"invoke_azure_api: retry {retry + 1}/{node.retry_count + 1}, waiting {wait_time}s")
-                        time.sleep(wait_time)
-                    else:
-                        last_error = f"Status code: {response.status_code}"
-                        break  # Don't retry on client errors
                 except requests.exceptions.RequestException as error:
                     last_error = f"Request exception: {type(error).__name__}"
                     ocf.logger.debug(
@@ -319,7 +314,31 @@ class AzureHelper:
                         type(error).__name__, int((time.monotonic() - request_started) * 1000))
                     wait_time = node.retry_wait * (2 ** retry)
                     ocf.logger.debug(f"invoke_azure_api: retry {retry + 1}/{node.retry_count + 1} due to exception, waiting {wait_time}s")
+                    if deadline is not None and wait_time >= remaining_time(deadline):
+                        raise TimeoutError("Azure API retry would exceed the alignment operation deadline")
                     time.sleep(wait_time)
+                    continue
+
+                ocf.logger.debug(
+                    "azure_api_attempt: method=%s endpoint=%s api_version=%s attempt=%s/%s "
+                    "timeout_s=%s status=%s outcome=response_received elapsed_ms=%s response_bytes=%s",
+                    method, endpoint, api_version, attempts, node.retry_count + 1, request_timeout,
+                    response.status_code, int((time.monotonic() - request_started) * 1000),
+                    len(getattr(response, "content", b"") or b""))
+                if deadline is not None:
+                    remaining_time(deadline)
+                if response.status_code in [200, 201, 202]:
+                    success = True
+                    outcome = "success"
+                    break
+                last_error = f"Status code: {response.status_code}"
+                if response.status_code not in [429, 500, 502, 503, 504]:
+                    break
+                wait_time = node.retry_wait * (2 ** retry)
+                ocf.logger.debug(f"invoke_azure_api: retry {retry + 1}/{node.retry_count + 1}, waiting {wait_time}s")
+                if deadline is not None and wait_time >= remaining_time(deadline):
+                    raise TimeoutError("Azure API retry would exceed the alignment operation deadline")
+                time.sleep(wait_time)
 
             if not success:
                 error_msg = (
@@ -328,6 +347,12 @@ class AzureHelper:
                 ocf.logger.error(error_msg)
                 raise Exception(error_msg)
             return response
+        except TimeoutError:
+            outcome = "deadline_exceeded"
+            ocf.logger.error(
+                "Azure API deadline exceeded: method=%s endpoint=%s api_version=%s attempts=%s",
+                method, endpoint, api_version, attempts)
+            raise
         finally:
             ocf.logger.debug(
                 "azure_api_summary: method=%s endpoint=%s api_version=%s attempts=%s outcome=%s elapsed_ms=%s",
@@ -475,7 +500,7 @@ class AzureHelper:
         return responses
 
     @staticmethod
-    def run_command_on_linux_vms(node, vm_names, command, command_execution_timeout=COMMAND_EXECUTION_TIMEOUT_DEFAULT):
+    def run_command_on_linux_vms(node, vm_names, command, command_execution_timeout=COMMAND_EXECUTION_TIMEOUT_DEFAULT, output_marker=None):
         """
         Execute a command on multiple Linux VMs using Azure Run Command.
         
@@ -484,6 +509,7 @@ class AzureHelper:
             vm_names: List of VM names or single VM name string
             command: Shell command to execute
             command_execution_timeout: Timeout in seconds for command execution
+            output_marker: Optional prefix distinguishing this execution from stale instanceView output
             
         Returns:
             list: List of dictionaries with execution results for each VM
@@ -495,6 +521,10 @@ class AzureHelper:
 
         if not isinstance(vm_names, list):
             vm_names = [vm_names]
+
+        deadline = getattr(node, 'operation_deadline', None)
+        if deadline is not None:
+            deadline = min(deadline, time.monotonic() + command_execution_timeout)
 
         # Refresh token if needed before making API calls
         node.refresh_token_if_needed()
@@ -518,10 +548,12 @@ class AzureHelper:
                     "timeoutInSeconds": random.randint(command_execution_timeout, (command_execution_timeout + 300))
                 }
             }
+            if deadline is not None:
+                body["properties"]["timeoutInSeconds"] = max(1, int(remaining_time(deadline)))
             ocf.logger.debug(
                 "run_command_on_linux_vms: vm=%s script_chars=%s timeout_s=%s",
                 vm_name, len(command), body["properties"]["timeoutInSeconds"])
-            response = AzureHelper.invoke_api(node, url, 'put', headers=headers, body=body, params=params)
+            response = AzureHelper.invoke_api(node, url, 'put', headers=headers, body=body, params=params, deadline=deadline)
             ocf.logger.debug(
                 "run_command_on_linux_vms: delivered vm=%s status=%s",
                 vm_name, getattr(response, "status_code", None))
@@ -541,7 +573,7 @@ class AzureHelper:
                 url = f"{node.management_url}/subscriptions/{node.subscription_id}/resourceGroups/{node.resource_group}/providers/Microsoft.Compute/virtualMachines/{vm_name}/runCommands/azure-sap-zone"
                 params = {'$expand': 'instanceView', 'api-version': AzureHelper.VM_API_VERSION}
                 headers = {'Authorization': f'Bearer {node.access_token}', **AzureHelper.DEFAULT_HEADERS}
-                status_response = AzureHelper.invoke_api(node, url, 'get', headers=headers, params=params)
+                status_response = AzureHelper.invoke_api(node, url, 'get', headers=headers, params=params, deadline=deadline)
                 instance_view = status_response.json()['properties']['instanceView']
                 execution_state = instance_view['executionState']
                 exit_code = instance_view['exitCode']
@@ -555,19 +587,30 @@ class AzureHelper:
                 else:
                     stdout = instance_view['output']
                     stderr = instance_view['error']
+                    if output_marker is not None and (not isinstance(stdout, str) or not stdout.startswith(output_marker)):
+                        ocf.logger.debug(f"Waiting for current command output on {vm_name}")
+                        pending_vms.append(vm_name)
+                        all_vms_completed = False
+                        continue
                     item['stdout'] = stdout
                     item['stderr'] = stderr
                     ocf.logger.debug(
                         "run_command_on_linux_vms: vm=%s stdout_length=%s stderr_length=%s stderr=%r",
                         vm_name, len(stdout or ""), len(stderr or ""), _diagnostic_excerpt(stderr))
-                    ocf.logger.debug("run_command_on_linux_vms: stdout=%r", _diagnostic_excerpt(stdout))
+                    if output_marker is None:
+                        ocf.logger.debug("run_command_on_linux_vms: stdout=%r", _diagnostic_excerpt(stdout))
+            if deadline is not None:
+                remaining_time(deadline)
             if time.time() - start_time > command_execution_timeout:
                 error_message = f"Command execution has not finished on vms {pending_vms} within the timeout period of {command_execution_timeout} seconds. Ensure that Azure Linux VM Agent is running on the VM"
                 ocf.logger.error(error_message)
                 raise Exception(error_message)
             if not all_vms_completed:
                 ocf.logger.debug(f"Sleeping for {POLLING_INTERVAL_SECONDS} seconds before checking the status again...")
-                time.sleep(POLLING_INTERVAL_SECONDS)
+                delay = POLLING_INTERVAL_SECONDS
+                if deadline is not None:
+                    delay = min(delay, remaining_time(deadline))
+                time.sleep(delay)
         
         ocf.logger.debug(f"Note: Some commands, such as sapcontrol -function GetProcessList, return an execution_state of 'failed' even when the command is successful. In these cases, the exit codes will be {ACCEPTED_SAP_EXIT_CODES}. These exit codes should be ignored and considered as successful.")
         failed_vms = [item for item in output if item.get('exit_code') not in ACCEPTED_SAP_EXIT_CODES]
@@ -665,8 +708,10 @@ class SAPHelper:
         return output
 
     @staticmethod
-    def check_and_start_sap_instance(node, vm_names, instance=None):
+    def check_and_start_sap_instance(node, vm_names, instance=None, preparation_only=False):
         ocf.logger.debug("check_and_start_sap_instance: Started")
+        if preparation_only:
+            return SAPHelper._check_application_instances(node, vm_names, True, instance)
         
         # Validate inputs
         SAPHelper._validate_token(node.sid, SAP_SID_PATTERN, 'SID')
@@ -730,6 +775,185 @@ class SAPHelper:
 
         ocf.logger.debug("check_and_start_sap_instance: Finished")
         return output
+
+    @staticmethod
+    def check_and_activate_sap_instances(node, vm_names):
+        return SAPHelper._check_application_instances(node, vm_names, False)
+
+    @staticmethod
+    def _check_application_instances(node, vm_names, prepare, instance=None):
+        SAPHelper._validate_token(node.sid, SAP_SID_PATTERN, 'SID')
+        if instance is not None:
+            SAPHelper._validate_token(str(instance), r'^\d{2}$', 'instance number')
+        if not vm_names or len(set(vm_names)) != len(vm_names):
+            raise ValueError("Expected a nonempty, unique list of application VMs")
+        marker = uuid.uuid4().hex
+        # A fresh marker also forces Azure to execute each retry, and detects stale/truncated output.
+        command = r'''
+set -eu
+export LC_ALL=C
+instances=""
+for directory in /usr/sap/@SID@/D[0-9][0-9]; do
+    [ -d "$directory" ] || continue
+    instance=${directory##*/D}
+    if [ -z "@INSTANCE@" ] || [ "$instance" = "@INSTANCE@" ]; then
+        instances="$instances $instance"
+    fi
+done
+if [ -z "$instances" ]; then
+    echo "No application instances found for SID @SID@" >&2
+    exit 1
+fi
+work=$(mktemp -d)
+trap 'rm -f -- "$work/stdout" "$work/stderr"; rmdir -- "$work"' EXIT
+printf '@MARKER@\tmanifest%s\n' "$(printf '\t%s' $instances)"
+run_sapcontrol() {
+    function=$1
+    shift
+    if su - @SIDADM@ -c "sapcontrol -nr ${instance} -function ${function} $*" >"$work/stdout" 2>"$work/stderr"; then
+        sap_rc=0
+    else
+        sap_rc=$?
+    fi
+    printf '@MARKER@\tresult\t%s\t%s\t%s\t%s\t%s\n' "$instance" "$function" "$sap_rc" \
+        "$(base64 <"$work/stdout" | tr -d '\n')" "$(base64 <"$work/stderr" | tr -d '\n')"
+}
+acknowledged() {
+    [ "$sap_rc" -eq 0 ] && grep -qx 'OK' "$work/stdout"
+}
+for instance in $instances; do
+    run_sapcontrol GetProcessList
+    case "$sap_rc" in
+        0|3|4) ;;
+        *) echo "GetProcessList failed for instance $instance" >&2; exit 1 ;;
+    esac
+    if ! grep -qx 'OK' "$work/stdout" || ! grep -q '^name, description, dispstatus, textstatus,' "$work/stdout"; then
+        echo "Invalid GetProcessList response for instance $instance" >&2
+        exit 1
+    fi
+    state=$(awk -F', ' '
+        /^name, / { next }
+        NF == 7 { count++; if ($3 != "GREEN") nongreen++; if ($3 != "GRAY") nongray++ }
+        END {
+            if (!count) exit 1
+            if (!nongreen) print "GREEN"
+            else if (!nongray) print "GRAY"
+            else print "PENDING"
+        }' "$work/stdout")
+    if [ "@PREPARE@" = "true" ]; then
+        if grep -qi 'Soft Shutdown' "$work/stdout"; then
+            run_sapcontrol StopWait @STOP_TIMEOUT@ 2
+            if acknowledged; then
+                run_sapcontrol Start
+            fi
+        elif [ "$state" = "GRAY" ]; then
+            run_sapcontrol Start
+        fi
+    elif [ "$state" = "GREEN" ] && ! grep -qi 'Soft Shutdown' "$work/stdout"; then
+        run_sapcontrol ABAPSetServerInactive active
+    fi
+done
+printf '@MARKER@\tcomplete\n'
+'''
+        for key, value in (
+                ("SID", node.sid), ("SIDADM", shlex.quote(node.sid.lower() + "adm")),
+                ("INSTANCE", str(instance) if instance is not None else ""),
+                ("MARKER", marker), ("PREPARE", "true" if prepare else "false"),
+                ("STOP_TIMEOUT", str(int(node.soft_shutdown_timeout)))):
+            command = command.replace("@" + key + "@", value)
+        output = AzureHelper.run_command_on_linux_vms(
+            node, vm_names, command, output_marker=marker + '\tmanifest\t')
+        if (not output or len(output) != len(vm_names)
+                or {item.get('vm_name') for item in output} != set(vm_names)):
+            raise ValueError("Incomplete application VM results")
+        ready = True
+        preparation_errors = []
+        for item in output:
+            vm_name = item['vm_name']
+            if item.get('exit_code') != 0:
+                raise ValueError(
+                    f"Application command wrapper failed on {vm_name}: exit_code={item.get('exit_code')}, "
+                    f"stderr={_diagnostic_excerpt(item.get('stderr'))!r}")
+            lines = item['stdout'].splitlines()
+            if (len(lines) < 3 or not lines[0].startswith(marker + '\tmanifest\t')
+                    or lines[-1] != marker + '\tcomplete'):
+                raise ValueError(f"Missing, stale or truncated application results on {vm_name}")
+            instances = lines[0].split('\t')[2:]
+            if (not instances or len(set(instances)) != len(instances)
+                    or any(not re.fullmatch(r'\d{2}', inst) for inst in instances)):
+                raise ValueError(f"Invalid application instance manifest on {vm_name}")
+            records = {}
+            for line in lines[1:-1]:
+                fields = line.split('\t')
+                if len(fields) != 7 or fields[:2] != [marker, 'result']:
+                    raise ValueError(f"Invalid application result on {vm_name}")
+                _, _, inst, function, rc, stdout, stderr = fields
+                key = (inst, function)
+                if inst not in instances or key in records or not rc.isdigit():
+                    raise ValueError(f"Duplicate or unexpected application result on {vm_name}: {key}")
+                records[key] = (
+                    int(rc), base64.b64decode(stdout, validate=True).decode('utf-8'),
+                    base64.b64decode(stderr, validate=True).decode('utf-8'))
+            expected = set()
+            for inst in instances:
+                key = (inst, 'GetProcessList')
+                expected.add(key)
+                if key not in records:
+                    raise ValueError(f"Missing process report for {vm_name}/{inst}")
+                rc, stdout, stderr = records[key]
+                if rc not in ACCEPTED_SAP_EXIT_CODES or 'OK' not in stdout.splitlines():
+                    raise ValueError(
+                        f"Invalid process report for {vm_name}/{inst}: "
+                        f"{_diagnostic_excerpt(stdout)!r}; {_diagnostic_excerpt(stderr)!r}")
+                procs = SAPHelper.format_sapcontrol_output(stdout)
+                if (not procs or not any(p.get('name') == 'disp+work' for p in procs)
+                        or any(p.get('dispstatus') not in ('GREEN', 'GRAY', 'YELLOW', 'RED') for p in procs)):
+                    raise ValueError(f"Incomplete application process report for {vm_name}/{inst}")
+                soft_shutdown = any('soft shutdown' in p.get('textstatus', '').lower() for p in procs)
+                green = all(p['dispstatus'] == 'GREEN' for p in procs) and not soft_shutdown
+                if prepare:
+                    functions = []
+                    if soft_shutdown:
+                        functions.append('StopWait')
+                    if soft_shutdown or all(p['dispstatus'] == 'GRAY' for p in procs):
+                        functions.append('Start')
+                    for function in functions:
+                        key = (inst, function)
+                        expected.add(key)
+                        result = records.get(key)
+                        if result is None or result[0] != 0 or 'OK' not in result[1].splitlines():
+                            preparation_errors.append(f"{vm_name}/{inst} {function}: {_diagnostic_excerpt(result)}")
+                            if function == 'StopWait':
+                                expected.discard((inst, 'Start'))
+                                break
+                elif green:
+                    key = (inst, 'ABAPSetServerInactive')
+                    expected.add(key)
+                    if key not in records:
+                        raise ValueError(f"Missing activation response for {vm_name}/{inst}")
+                    rc, stdout, stderr = records[key]
+                    response = stdout.splitlines()
+                    if ('ABAPSetServerInactive' not in response
+                            or not any(line == 'OK' or line.startswith('FAIL:') for line in response)):
+                        raise ValueError(
+                            f"Invalid SAP activation response for {vm_name}/{inst}: "
+                            f"{_diagnostic_excerpt(stdout)!r}; {_diagnostic_excerpt(stderr)!r}")
+                    if rc != 0 or 'OK' not in response:
+                        ready = False
+                        ocf.logger.warning(
+                            f"SAP activation pending on {vm_name}/{inst}: exit={rc}, "
+                            f"stdout={_diagnostic_excerpt(stdout)!r}, stderr={_diagnostic_excerpt(stderr)!r}. Retrying on a later monitor "
+                            "within the original wait_time deadline.")
+                    else:
+                        ocf.logger.info(f"SAP activation acknowledged on {vm_name}/{inst}")
+                else:
+                    ready = False
+                    ocf.logger.info(f"SAP processes not ready for activation on {vm_name}/{inst}")
+            if set(records) != expected:
+                raise ValueError(f"Unexpected application operation results on {vm_name}")
+        if preparation_errors:
+            raise ValueError("SAP process preparation failed: " + "; ".join(preparation_errors))
+        return ready
 
     
     @staticmethod
@@ -835,6 +1059,7 @@ Class to define the node object
 class Node:
     def __init__(self, ra):
         self.ra_owner = ra
+        self.operation_deadline = getattr(ra, 'operation_deadline', None)
         
         self.sid = ocf.get_parameter("sid", "")
         self.hana_sid = ocf.get_parameter("hana_sid", self.sid)
@@ -1013,7 +1238,8 @@ class Node:
 Main class to define the AzureSapZone resource agent
 """
 class AzureSapZone:
-    def __init__(self):
+    def __init__(self, operation_deadline=None):
+        self.operation_deadline = operation_deadline
         self.node = Node(self)
     
     def start(self):    
@@ -1357,7 +1583,9 @@ class AzureSapZone:
         ocf.logger.info(f"Executing phase: start_sap_in_same_zone")
         ocf.logger.info(f"Starting SAP on VMs: {same_zone_app_vmnames}")
         ocf.logger.debug(f"phase_start_sap_in_same_zone: Started (vm_count={len(same_zone_app_vmnames)})")
-        SAPHelper.check_and_start_sap_instance(self.node, same_zone_app_vmnames)
+        SAPHelper.check_and_start_sap_instance(
+            self.node, same_zone_app_vmnames,
+            preparation_only=not ocf.is_true(self.node.stop_vms))
         self.node.set_phase('wait_for_sap_in_same_zone_to_start')
         ocf.logger.debug("phase_start_sap_in_same_zone: Finished")
 
@@ -1365,7 +1593,21 @@ class AzureSapZone:
         ocf.logger.info(f"Executing phase: wait_for_sap_in_same_zone_to_start")
         ocf.logger.debug(f"phase_wait_for_sap_in_same_zone_to_start: Started (vm_count={len(same_zone_app_vmnames)})")
         if self.node.check_timeout():
-            raise ValueError("Timeout reached. One or more SAP instances are not started yet")
+            raise ValueError("Timeout reached. One or more SAP instances have not started or acknowledged activation; see previous SAP diagnostics")
+
+        if not ocf.is_true(self.node.stop_vms):
+            phase_deadline = time.monotonic() + (
+                int(self.node.phase_start_time) + int(self.node.wait_time) - time.time())
+            self.node.operation_deadline = min(
+                getattr(self.node, 'operation_deadline', None) or phase_deadline, phase_deadline)
+            activated = SAPHelper.check_and_activate_sap_instances(self.node, same_zone_app_vmnames)
+            if self.node.check_timeout():
+                raise ValueError("SAP activation phase deadline reached; not advancing to other-zone passivation")
+            remaining_time(self.node.operation_deadline)
+            if activated:
+                ocf.logger.info("All SAP application instances acknowledged activation")
+                self.node.set_phase('stop_sap_in_diff_zone')
+            return
         
         try:
             sap_procs = SAPHelper.get_sap_procs(self.node, same_zone_app_vmnames)
@@ -1388,7 +1630,7 @@ class AzureSapZone:
         ocf.logger.info(f"Executing phase: stop_sap_in_diff_zone")
         ocf.logger.debug(f"phase_stop_sap_in_diff_zone: Started (vm_count={len(diff_zone_app_vmnames) if diff_zone_app_vmnames else 0})")
         if diff_zone_app_vmnames:
-            if self.node.stop_vms == 'true':
+            if ocf.is_true(self.node.stop_vms):
                 if self.node.check_timeout(int(self.node.wait_before_stop_sap)):
                     ocf.logger.info(f"Stopping SAP on VMs: {diff_zone_app_vmnames}")
                     SAPHelper.run_sapcontrol_function(self.node, diff_zone_app_vmnames, f"Stop {self.node.soft_shutdown_timeout}")
@@ -1546,7 +1788,15 @@ def monitor_action():
     ra, rc = None, None
     try:
         ocf.logger.debug("monitor_action: Started")
-        ra = AzureSapZone()
+        deadline = None
+        if not ocf.is_probe() and not ocf.is_true(ocf.get_parameter("stop_vms", "false")):
+            timeout = ocf.get_parameter("CRM_meta_timeout", None)
+            if timeout is not None:
+                timeout = float(timeout) / 1000
+                reserve = min(2 * CRM_COMMAND_TIMEOUT_SECONDS + 5, timeout / 10)
+                deadline = time.monotonic() + timeout - reserve
+                remaining_time(deadline)
+        ra = AzureSapZone(operation_deadline=deadline)
         rc = ra.monitor()
         return rc
     finally:
@@ -1794,7 +2044,7 @@ def main():
     agent.add_parameter(
         "stop_vms",
         shortdesc="Specifies whether to stop VMs in different zone",
-        longdesc="If set to True then the resource agent will soft shutdown the SAP instances and stop the VMs in a different zone. If set to False then the resource agent will set the instances in passive mode and not stop the VMs in the different zone",
+        longdesc="If set to True then the resource agent will soft shutdown the SAP instances and stop the VMs in a different zone. If set to False then the resource agent will set the instances in passive mode and not stop the VMs in the different zone. Before passivating the other zone, every same-zone application instance must acknowledge activation. Failed SAP activation attempts are retried on later monitors within the original wait_time deadline; successful Start or GREEN processes alone do not satisfy activation.",
         content_type="boolean",
         default="false")
     agent.add_parameter(
