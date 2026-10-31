@@ -93,22 +93,19 @@ class ClusterHelper:
             completed = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 universal_newlines=True,
                 timeout=CRM_COMMAND_TIMEOUT_SECONDS,
             )
             stdout, stderr = completed.stdout or "", completed.stderr or ""
             rc = completed.returncode
             outcome = "success" if rc == 0 else "failed"
-            ret = stdout.rstrip()
         except subprocess.TimeoutExpired as error:
             stdout, stderr = error.stdout or "", error.stderr or ""
             outcome = "timeout"
-            ret = None
-        except Exception as error:
+        except OSError as error:
             stderr = str(error)
-            outcome = "launch_error" if isinstance(error, OSError) else "execution_error"
-            ret = None
+            outcome = "launch_error"
 
         message = (
             f"crm_command: command={_diagnostic_excerpt(' '.join(shlex.quote(arg) for arg in cmd))!r} "
@@ -118,9 +115,9 @@ class ClusterHelper:
             f"stdout={_diagnostic_excerpt(stdout)!r} stderr={_diagnostic_excerpt(stderr)!r}")
         if outcome != "success":
             ocf.logger.error(message)
-        else:
-            ocf.logger.debug(message)
-        return ret
+            raise RuntimeError(message)
+        ocf.logger.debug(message)
+        return stdout.rstrip()
 
     @staticmethod
     def setAttr(key, value, node=None):
@@ -133,7 +130,7 @@ class ClusterHelper:
 
         delete = _is_empty(value)
         if not delete:
-            ret = ClusterHelper._exec(
+            ClusterHelper._exec(
                 "crm_attribute",
                 "--name",
                 key,
@@ -142,7 +139,7 @@ class ClusterHelper:
                 ClusterHelper._getLocation(node),
             )
         else:
-            ret = ClusterHelper._exec(
+            ClusterHelper._exec(
                 "crm_attribute",
                 "--name",
                 key,
@@ -150,10 +147,10 @@ class ClusterHelper:
                 ClusterHelper._getLocation(node),
             )
         ocf.logger.debug(
-            "setAttr: operation=%s key=%s node=%s scope=%s value=%r outcome=%s",
+            "setAttr: operation=%s key=%s node=%s scope=%s value=%r outcome=success",
             "delete" if delete else "update", key, node, "nodes" if node else "crm_config",
-            _diagnostic_excerpt(value), "success" if ret is not None else "failed")
-        return ret is not None
+            _diagnostic_excerpt(value))
+        return True
 
     @staticmethod
     def getAttr(key, node=None):
@@ -987,10 +984,12 @@ class Node:
     # function to set the current phase and phase start time
     def set_phase(self, phase):
         ocf.logger.debug(f"set_phase: Started (phase={phase})")
+        # These CIB writes remain non-atomic; only update local state after both succeed.
+        ClusterHelper.setAttr("azure_sap_zone_current_phase", phase, self.hostname)
+        phase_start_time = int(time.time())
+        ClusterHelper.setAttr("azure_sap_zone_phase_start_time", phase_start_time, self.hostname)
         self.current_phase = phase
-        ClusterHelper.setAttr("azure_sap_zone_current_phase", self.current_phase, self.hostname)
-        self.phase_start_time = int(time.time())
-        ClusterHelper.setAttr("azure_sap_zone_phase_start_time", self.phase_start_time, self.hostname)
+        self.phase_start_time = phase_start_time
         ocf.logger.debug(f"set_phase: Finished (phase={self.current_phase}, phase_start_time={self.phase_start_time})")
 
     # function to check if the timeout is reached
@@ -1190,8 +1189,8 @@ class AzureSapZone:
     def handle_non_primary_node(self):
         ocf.logger.debug("handle_non_primary_node: Started")
         ocf.logger.info("This is not the primary node or the node is not ready yet. No action required...")
+        ClusterHelper.setAttr("azure_sap_zone_current_phase", "no_action_required", self.node.hostname)
         self.node.current_phase = 'no_action_required'
-        ClusterHelper.setAttr("azure_sap_zone_current_phase", self.node.current_phase, self.node.hostname)
         ocf.logger.debug("handle_non_primary_node: Finished")
 
     def execute_phases(self):
