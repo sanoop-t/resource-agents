@@ -31,6 +31,7 @@ import ocf
 VERSION = "1.9"
 default_loglevel = ocf.logging.INFO
 UUID_REGEX = re.compile(r'^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$')
+SAP_SID_PATTERN = r'^[A-Z][A-Z0-9]{2}\Z'
 VM_NAME_REGEX = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$')
 ZONE_GROUP_REGEX = re.compile(r'^[A-Za-z0-9]+$')
 
@@ -624,7 +625,7 @@ class SAPHelper:
         ocf.logger.debug("run_sapcontrol_function: Started")
         
         # Validate inputs to prevent command injection
-        SAPHelper._validate_token(node.sid, r'^[A-Za-z0-9_]+$', 'SID')
+        SAPHelper._validate_token(node.sid, SAP_SID_PATTERN, 'SID')
         if instance is not None:
             SAPHelper._validate_token(str(instance), r'^\d{2}$', 'instance number')
         function_name, function_args = SAPHelper._parse_function_and_args(function)
@@ -668,7 +669,7 @@ class SAPHelper:
         ocf.logger.debug("check_and_start_sap_instance: Started")
         
         # Validate inputs
-        SAPHelper._validate_token(node.sid, r'^[A-Za-z0-9_]+$', 'SID')
+        SAPHelper._validate_token(node.sid, SAP_SID_PATTERN, 'SID')
         if instance is not None:
             SAPHelper._validate_token(str(instance), r'^\d{2}$', 'instance number')
             
@@ -1551,7 +1552,7 @@ def monitor_action():
     finally:
         _log_action_summary("monitor", started, ra, rc)
 
-def validate_action(sid, soft_shutdown_timeout, app_vm_names, client_id, app_vm_name_pattern, hana_resource, app_vm_zones=None, hana_vm_zones=None, azure_environment=None, azure_management_endpoint=None):
+def validate_action(sid, soft_shutdown_timeout, app_vm_names, client_id, app_vm_name_pattern, hana_resource, app_vm_zones=None, hana_vm_zones=None, azure_environment=None, azure_management_endpoint=None, hana_sid=None):
     ocf.logger.debug("validate_action: Started")
 
     validation_errors = []
@@ -1560,9 +1561,11 @@ def validate_action(sid, soft_shutdown_timeout, app_vm_names, client_id, app_vm_
     if not sid or soft_shutdown_timeout is None or not hana_resource:
         validation_errors.append("Missing one or more required parameters: sid, soft_shutdown_timeout, and hana_resource")
     
-    # make sure that sid is a valid SAP SID
-    if sid and not re.match(r'^[A-Z]{3,4}$', sid):
-        validation_errors.append("sid must be a valid SAP SID (3 or 4 uppercase letters)")
+    for name, value in (("sid", sid), ("hana_sid", hana_sid)):
+        if value and not re.match(SAP_SID_PATTERN, value):
+            validation_errors.append(
+                f"{name} must contain exactly 3 characters: an uppercase letter "
+                "followed by 2 uppercase letters or digits")
 
     # validate that hana resource is a valid resource name
     if hana_resource and not re.match(r'^[a-zA-Z0-9_-]+$', hana_resource):
@@ -1701,13 +1704,13 @@ def main():
     agent.add_parameter(
         "sid",
         shortdesc="Configure a sid",
-        longdesc="Set the SAP SID name",
+        longdesc="SAP system ID: exactly 3 characters, starting with an uppercase letter followed by 2 uppercase letters or digits.",
         content_type="string",
         default="")
     agent.add_parameter(
         "hana_sid",
         shortdesc="Configure a sid",
-        longdesc="Set the HANA SID name. You can leave this parameter blank if the SID is the same as the HANA SID",
+        longdesc="HANA system ID: exactly 3 characters, starting with an uppercase letter followed by 2 uppercase letters or digits. Leave unset to use sid.",
         content_type="string",
         default="")
     agent.add_parameter(
