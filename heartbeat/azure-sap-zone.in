@@ -1601,6 +1601,10 @@ class AzureSapZone:
             self.node.operation_deadline = min(
                 getattr(self.node, 'operation_deadline', None) or phase_deadline, phase_deadline)
             activated = SAPHelper.check_and_activate_sap_instances(self.node, same_zone_app_vmnames)
+            if not activated:
+                # A shutdown may finish after the initial preparation snapshot.
+                SAPHelper.check_and_start_sap_instance(
+                    self.node, same_zone_app_vmnames, preparation_only=True)
             if self.node.check_timeout():
                 raise ValueError("SAP activation phase deadline reached; not advancing to other-zone passivation")
             remaining_time(self.node.operation_deadline)
