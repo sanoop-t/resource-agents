@@ -1416,8 +1416,9 @@ class AzureSapZone:
     def handle_non_primary_node(self):
         ocf.logger.debug("handle_non_primary_node: Started")
         ocf.logger.info("This is not the primary node or the node is not ready yet. No action required...")
-        ClusterHelper.setAttr("azure_sap_zone_current_phase", "no_action_required", self.node.hostname)
-        self.node.current_phase = 'no_action_required'
+        if self.node.current_phase != 'no_action_required':
+            ClusterHelper.setAttr("azure_sap_zone_current_phase", "no_action_required", self.node.hostname)
+            self.node.current_phase = 'no_action_required'
         ocf.logger.debug("handle_non_primary_node: Finished")
 
     def execute_phases(self):
