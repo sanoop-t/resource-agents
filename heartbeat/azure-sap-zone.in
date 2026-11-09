@@ -83,7 +83,7 @@ class ClusterHelper:
         return ["--type", "crm_config"]
 
     @staticmethod
-    def _exec(command, *args):
+    def _exec(command, *args, timeout=CRM_COMMAND_TIMEOUT_SECONDS):
         """Helper function to execute a UNIX command."""
         args = list(args)
 
@@ -105,7 +105,7 @@ class ClusterHelper:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
-                timeout=CRM_COMMAND_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
             stdout, stderr = completed.stdout or "", completed.stderr or ""
             rc = completed.returncode
@@ -121,7 +121,7 @@ class ClusterHelper:
             f"crm_command: command={_diagnostic_excerpt(' '.join(shlex.quote(arg) for arg in cmd))!r} "
             f"outcome={outcome} rc={rc if rc is not None else 'unknown'} "
             f"elapsed_ms={int((time.monotonic() - started) * 1000)} "
-            f"timeout_s={CRM_COMMAND_TIMEOUT_SECONDS} stdout_length={len(stdout)} stderr_length={len(stderr)} "
+            f"timeout_s={timeout} stdout_length={len(stdout)} stderr_length={len(stderr)} "
             f"stdout={_diagnostic_excerpt(stdout)!r} stderr={_diagnostic_excerpt(stderr)!r}")
         if outcome != "success":
             ocf.logger.error(message)
@@ -185,7 +185,7 @@ class ClusterHelper:
         return val if not val.isdigit() else int(val)
 
     @staticmethod
-    def getStatusAttr(key, node=None):
+    def getStatusAttr(key, node=None, timeout=CRM_COMMAND_TIMEOUT_SECONDS):
         """Retrieve a status attribute from the Pacemaker cluster."""
         ocf.logger.debug("getStatusAttr: begin; key = %s, node = %s" % (key, node))
         val = ClusterHelper._exec(
@@ -198,6 +198,7 @@ class ClusterHelper:
             "--quiet",
             "--default",
             "",
+            timeout=timeout,
         )
         ocf.logger.debug(
             "getStatusAttr: key=%s node=%s scope=status outcome=%s value=%r",
@@ -205,6 +206,26 @@ class ClusterHelper:
         if not val:
             return None
         return val if not val.isdigit() else int(val)
+
+    @staticmethod
+    def setStatusAttr(key, value, node):
+        """Write transient state and verify visibility through the same CIB read path."""
+        expected = None if value is None or str(value).strip().lower() in ("", "none") else str(value)
+        deadline = time.monotonic() + CRM_COMMAND_TIMEOUT_SECONDS
+        operation = ["--delete"] if expected is None else ["--update", expected]
+        ClusterHelper._exec(
+            "crm_attribute", "--node", node, "--name", key,
+            "--lifetime", "reboot", operation,
+            timeout=max(0.001, deadline - time.monotonic()))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"Transient attribute write was not visible before deadline: {key}")
+            actual = ClusterHelper.getStatusAttr(key, node, timeout=remaining)
+            actual = None if actual is None else str(actual)
+            if actual == expected:
+                return True
+            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
 
 """
 Helper functions for Azure
@@ -1100,10 +1121,8 @@ class Node:
         self.sync_state = ClusterHelper.getStatusAttr(f"hana_{self.hana_sid.lower()}_sync_state", self.hostname)
         # Keep hana_score as string to match the original primary-detection logic
         self.hana_score = str(ClusterHelper.getStatusAttr(f"master-{self.hana_resource}", self.hostname))
-        self.current_phase = ClusterHelper.getAttr(f"azure_sap_zone_current_phase", self.hostname)
-        self.phase_start_time = ClusterHelper.getAttr(f"azure_sap_zone_phase_start_time", self.hostname)
-        if not self.current_phase or self.current_phase in ['None', ''] or not self.phase_start_time or self.phase_start_time in ['None', '']:
-            self.set_phase('None')
+        self.current_phase = ClusterHelper.getStatusAttr("azure_sap_zone_current_phase", self.hostname)
+        self.phase_start_time = ClusterHelper.getStatusAttr("azure_sap_zone_phase_start_time", self.hostname)
         
         # get the resource group, subscription_id, location and vm name using Azure meta data api
         self.az_vm_name, self.subscription_id, self.location, resource_group, self.azure_zone, self.detected_azure_environment = AzureHelper.get_instance_metadata(self)
@@ -1211,9 +1230,9 @@ class Node:
     def set_phase(self, phase):
         ocf.logger.debug(f"set_phase: Started (phase={phase})")
         # These CIB writes remain non-atomic; only update local state after both succeed.
-        ClusterHelper.setAttr("azure_sap_zone_current_phase", phase, self.hostname)
-        phase_start_time = int(time.time())
-        ClusterHelper.setAttr("azure_sap_zone_phase_start_time", phase_start_time, self.hostname)
+        ClusterHelper.setStatusAttr("azure_sap_zone_current_phase", phase, self.hostname)
+        phase_start_time = int(time.time()) if phase is not None else None
+        ClusterHelper.setStatusAttr("azure_sap_zone_phase_start_time", phase_start_time, self.hostname)
         self.current_phase = phase
         self.phase_start_time = phase_start_time
         ocf.logger.debug(f"set_phase: Finished (phase={self.current_phase}, phase_start_time={self.phase_start_time})")
@@ -1238,6 +1257,16 @@ class Node:
 Main class to define the AzureSapZone resource agent
 """
 class AzureSapZone:
+    PHASE_METHODS = {
+        'start_vms_in_same_zone': 'phase_start_vms_in_same_zone',
+        'wait_for_vms_in_same_zone_to_start': 'phase_wait_for_vms_in_same_zone_to_start',
+        'start_sap_in_same_zone': 'phase_start_sap_in_same_zone',
+        'wait_for_sap_in_same_zone_to_start': 'phase_wait_for_sap_in_same_zone_to_start',
+        'stop_sap_in_diff_zone': 'phase_stop_sap_in_diff_zone',
+        'wait_for_sap_in_diff_zone_to_stop': 'phase_wait_for_sap_in_diff_zone_to_stop',
+        'stop_vms_in_diff_zone': 'phase_stop_vms_in_diff_zone',
+    }
+
     def __init__(self, operation_deadline=None):
         self.operation_deadline = operation_deadline
         self.node = Node(self)
@@ -1338,7 +1367,7 @@ class AzureSapZone:
     def stop(self):    
         ocf.logger.info("stop: Started")
         ocf.logger.debug("stop: Debug trace enabled")
-        self.node.set_phase('None')
+        self.node.set_phase(None)
         ocf.logger.info("stop: Finished")
         return ocf.OCF_SUCCESS
     
@@ -1347,11 +1376,20 @@ class AzureSapZone:
             ocf.logger.info("monitor: Started")
             ocf.logger.debug("monitor: Debug trace enabled")
             
-            if ocf.is_probe():
-                if not self.node.current_phase or self.node.current_phase in ['None', '']:
-                    return ocf.OCF_NOT_RUNNING
-                else:
-                     return ocf.OCF_SUCCESS
+            probe = ocf.is_probe()
+            if probe and self.node.current_phase is None and self.node.phase_start_time is None:
+                return ocf.OCF_NOT_RUNNING
+            valid_phases = ('Started', 'no_action_required', 'all_phases_completed')
+            try:
+                valid_time = int(self.node.phase_start_time) > 0
+            except (TypeError, ValueError):
+                valid_time = False
+            if (self.node.current_phase not in valid_phases
+                    and self.node.current_phase not in self.PHASE_METHODS) or not valid_time:
+                ocf.logger.error("Missing or invalid transient phase state; resource-agent recovery required")
+                return ocf.OCF_ERR_GENERIC
+            if probe:
+                return ocf.OCF_SUCCESS
             
             self.log_node_details()
             
@@ -1417,7 +1455,7 @@ class AzureSapZone:
         ocf.logger.debug("handle_non_primary_node: Started")
         ocf.logger.info("This is not the primary node or the node is not ready yet. No action required...")
         if self.node.current_phase != 'no_action_required':
-            ClusterHelper.setAttr("azure_sap_zone_current_phase", "no_action_required", self.node.hostname)
+            ClusterHelper.setStatusAttr("azure_sap_zone_current_phase", "no_action_required", self.node.hostname)
             self.node.current_phase = 'no_action_required'
         ocf.logger.debug("handle_non_primary_node: Finished")
 
@@ -1449,21 +1487,10 @@ class AzureSapZone:
                 raise ValueError("One or more servers have MESSAGESERVER, ENQUE, or HDB processes running. Please provide correct app_vm_names")
             self.node.set_phase('start_vms_in_same_zone')
 
-        phase_methods = {
-            'start_vms_in_same_zone': self.phase_start_vms_in_same_zone,
-            'wait_for_vms_in_same_zone_to_start': self.phase_wait_for_vms_in_same_zone_to_start,
-            'start_sap_in_same_zone': self.phase_start_sap_in_same_zone,
-            'wait_for_sap_in_same_zone_to_start': self.phase_wait_for_sap_in_same_zone_to_start,
-            'stop_sap_in_diff_zone': self.phase_stop_sap_in_diff_zone,
-            'wait_for_sap_in_diff_zone_to_stop': self.phase_wait_for_sap_in_diff_zone_to_stop,
-            'stop_vms_in_diff_zone': self.phase_stop_vms_in_diff_zone,
-        }
-
-        if self.node.current_phase in phase_methods:
-            phase_methods[self.node.current_phase](same_zone_app_vmnames, diff_zone_app_vmnames)
+        if self.node.current_phase in self.PHASE_METHODS:
+            getattr(self, self.PHASE_METHODS[self.node.current_phase])(same_zone_app_vmnames, diff_zone_app_vmnames)
         else:
-            ocf.logger.info("All phases have been executed successfully")
-            self.node.set_phase('all_phases_completed')
+            raise ValueError(f"Unknown alignment phase: {self.node.current_phase}")
         
         ocf.logger.info("execute_phases: Finished")
 
